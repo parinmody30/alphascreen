@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.venv/
+equity_research_dashboard.html
