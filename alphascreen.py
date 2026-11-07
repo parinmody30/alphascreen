@@ -752,7 +752,8 @@ def classify_styles(df, pillar_score, risk_score, sector_median_div_yield):
 
     add(risk_score >= 65, "High Risk")
 
-    styles = styles.apply(lambda lst: lst if lst else ["Unclassified"])
+    # No single factor stands out -> an all-round profile, not a missing label.
+    styles = styles.apply(lambda lst: lst if lst else ["Balanced"])
     return styles
 
 
@@ -1832,8 +1833,10 @@ function radarSVG(scoresObj, size, colors){
   }).join("");
   let spokes = PILLARS.map((_,i)=>{ const [x,y]=pt(i,100); return `<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" stroke="rgba(148,163,184,0.12)"/>`; }).join("");
   let labels = PILLARS.map((k,i)=>{
-    const [x,y]=pt(i,122);
-    return `<text x="${x}" y="${y}" text-anchor="middle" dominant-baseline="middle" font-size="11" fill="var(--text-2)" font-weight="600">${PILLAR_LABEL[k]}</text>`;
+    const [x,y]=pt(i,118);
+    // anchor side labels away from the chart so long names aren't clipped
+    const anchor = x < cx-4 ? "end" : (x > cx+4 ? "start" : "middle");
+    return `<text x="${x}" y="${y}" text-anchor="${anchor}" dominant-baseline="middle" font-size="11" fill="var(--text-2)" font-weight="600">${PILLAR_LABEL[k]}</text>`;
   }).join("");
   let polys = seriesList.map((s,si)=>{
     const pts = PILLARS.map((k,i)=>pt(i, s[k]||0).join(",")).join(" ");
@@ -1841,7 +1844,8 @@ function radarSVG(scoresObj, size, colors){
     return `<polygon points="${pts}" fill="${c}" fill-opacity="0.18" stroke="${c}" stroke-width="2"/>` +
       PILLARS.map((k,i)=>{ const [x,y]=pt(i,s[k]||0); return `<circle cx="${x}" cy="${y}" r="3" fill="${c}"/>`; }).join("");
   }).join("");
-  return `<svg width="100%" viewBox="0 0 ${size} ${size}">${rings}${spokes}${polys}${labels}</svg>`;
+  const padX = 70;  // horizontal room for side labels like "Ownership" / "Valuation"
+  return `<svg width="100%" viewBox="${-padX} 0 ${size+2*padX} ${size}">${rings}${spokes}${polys}${labels}</svg>`;
 }
 
 function openCompany(name){
@@ -2201,6 +2205,9 @@ function exportExcel(records){
 /* ---------------- INIT ---------------- */
 renderKPIs(); renderTopIdeas(); renderHistogram(); renderSignalChart(); renderSectorChart(); renderQualityLog();
 populateFilterOptions(); renderRankTable(); renderSectorPage(); renderRedFlags(); renderCompare();
+// Pre-load the top-ranked company so the Company page is never blank.
+(function(){ const top = [...DATA.records].sort((a,b)=>b.scores.investment-a.scores.investment)[0];
+  if(top) document.getElementById("company-body").innerHTML = renderCompanyBody(top); })();
 </script>
 </body>
 </html>
