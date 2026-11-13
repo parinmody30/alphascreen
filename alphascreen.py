@@ -676,10 +676,26 @@ def compute_composite(df, pillar_z):
     raw = sum(pillar_z[k] * w for k, w in PILLAR_WEIGHTS.items())
     z = restandardize(raw, df.index)               # clipped: drives signals
     z_full = restandardize(raw, df.index, clip=False)  # unclipped: score + rank
+    return z, score_from_z(z_full), z_full.fillna(-99)
+
+
+def score_from_z(z_full):
     # Soft cap: tanh squashes the tails smoothly instead of hard-clipping at
     # z=3, so the best names keep distinct scores instead of all hitting 100.
     score = 50 + 50 * np.tanh(z_full / 3)
-    return z, to_safe_int(score.clip(0, 100), 50), z_full.fillna(-99)
+    return to_safe_int(score.clip(0, 100), 50)
+
+
+SEVERE_FLAG_Z_PENALTY = 1.5   # composite z deducted per serious red flag
+
+
+def apply_severe_flag_penalty(z_full, redlist):
+    """Lower the Investment Score (and rank) of companies carrying serious
+    red flags -- losing money or negative net worth -- so they can't sit at
+    the top of the rankings on the strength of their other factors."""
+    n_severe = redlist.apply(lambda fl: sum(f in SEVERE_RED_FLAGS for f in fl))
+    z_adj = z_full - SEVERE_FLAG_Z_PENALTY * n_severe
+    return score_from_z(z_adj), z_adj
 
 
 def compute_opportunity(pillar_z, df):
@@ -994,6 +1010,7 @@ def run_pipeline(raw_df, progress=None):
 
     p("Running the red-flag engine...")
     redcount, redlist = compute_red_flags(df, is_fin)
+    inv_score, z_rank = apply_severe_flag_penalty(z_rank, redlist)
 
     p("Classifying investment styles and generating recommendations...")
     signal = pd.Series([signal_for_row(zi, qi, ri, fl) for zi, qi, ri, fl in zip(z, pillar_score["quality"], redcount, redlist)],
