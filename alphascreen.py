@@ -62,7 +62,11 @@ RED_FLAG_THRESHOLDS = {
     "npm_min": 0.0,
     "revenue_growth_min": -10.0,
     "promoter_selldown_max": -2.0,   # 6M promoter holding change, percentage points
+    "suspicious_pe_max": 3.0,        # PE below this is almost never real, repeatable profit
+    "suspicious_ni_to_mcap": 0.5,    # net income above 50% of market cap
 }
+
+SUSPICIOUS_EARNINGS_FLAG = "Suspicious earnings data (possible one-off gain)"
 
 SHORTLIST_MIN_QUALITY = 70        # quality score out of 100
 SHORTLIST_MAX_PEG = 1.5
@@ -263,6 +267,11 @@ def clean_pipeline(raw):
     if dup_dropped:
         log.append(f"Removed {dup_dropped} duplicate company entr{'y' if dup_dropped == 1 else 'ies'} "
                     f"(kept the largest market-cap instance of each).")
+
+    # Keep the as-reported PE (before negatives are blanked and outliers
+    # clipped) so the red-flag engine can spot inconsistent earnings data.
+    if "pe" in df.columns:
+        df["_pe_raw"] = df["pe"].copy()
 
     # valuation sanity: a negative multiple isn't "cheap"
     for c in ("pe", "pb", "ev_ebitda"):
@@ -654,6 +663,19 @@ def compute_red_flags(df, is_fin):
         flags["Net loss-making"] = df["net_income"] < 0
     if "book_value" in df.columns:
         flags["Negative net worth (book value < 0)"] = df["book_value"] < 0
+    # Suspicious earnings: numbers that almost always mean a one-off gain
+    # (asset/stake sale, write-back) or bad data rather than real,
+    # repeatable profit -- and would otherwise inflate ROE and "cheapness".
+    sus = pd.Series(False, index=df.index)
+    if "_pe_raw" in df.columns:
+        sus |= df["_pe_raw"].between(0, t["suspicious_pe_max"], inclusive="neither")
+        if "net_income" in df.columns:
+            sus |= (df["_pe_raw"] < 0) & (df["net_income"] > 0)
+    if "net_income" in df.columns and "market_cap" in df.columns:
+        sus |= (df["market_cap"] > 0) & (df["net_income"] > t["suspicious_ni_to_mcap"] * df["market_cap"])
+    if sus.any():
+        flags[SUSPICIOUS_EARNINGS_FLAG] = sus
+
     if "promoter_change_6m" in df.columns:
         f = df["promoter_change_6m"] <= t["promoter_selldown_max"]
         if "promoter_holding" in df.columns:
@@ -730,6 +752,7 @@ SEVERE_RED_FLAGS = {
     "Structurally loss-making (5Y avg NPM < 0)",
     "Net loss-making",
     "Negative net worth (book value < 0)",
+    SUSPICIOUS_EARNINGS_FLAG,
 }
 
 
