@@ -73,6 +73,10 @@ SUSPICIOUS_EARNINGS_FLAG = "Suspicious earnings data (possible one-off gain)"
 # they are too small or too thinly traded to buy and sell reliably.
 MIN_BUY_MARKET_CAP_CR = 100       # market cap, Rs crore
 MIN_BUY_AVG_VOLUME_1M = 1000      # "1M Average Volume" column, in shares (missing = fails)
+# Average daily traded value = 1M average volume x close price, in Rs lakh.
+# Share counts alone overstate liquidity for SME stocks, which trade in big
+# lots: a handful of trades can still add up to thousands of shares.
+MIN_BUY_TRADED_VALUE_LAKH = 50
 
 SHORTLIST_MIN_QUALITY = 70        # quality score out of 100
 SHORTLIST_MAX_PEG = 1.5
@@ -790,7 +794,12 @@ def apply_investability_floors(df, signal):
     illiquid = pd.Series(False, index=df.index)
     if "avg_volume_1m" in df.columns:
         illiquid = df["avg_volume_1m"].isna() | (df["avg_volume_1m"] < MIN_BUY_AVG_VOLUME_1M)
-    cap = (too_small | illiquid) & signal.isin(["Buy", "Strong Buy"])
+    low_value = pd.Series(False, index=df.index)
+    traded_lakh = pd.Series(np.nan, index=df.index)
+    if "avg_volume_1m" in df.columns and "cmp" in df.columns:
+        traded_lakh = df["avg_volume_1m"] * df["cmp"] / 1e5
+        low_value = traded_lakh < MIN_BUY_TRADED_VALUE_LAKH   # NaN -> False (covered by `illiquid`)
+    cap = (too_small | illiquid | low_value) & signal.isin(["Buy", "Strong Buy"])
 
     # Plain-English reason shown on the Company page for each capped name.
     notes = pd.Series("", index=df.index)
@@ -806,6 +815,9 @@ def apply_investability_floors(df, signal):
             else:
                 reasons.append(f"its 1M average volume of {vol:,.0f} shares is below "
                                f"the {MIN_BUY_AVG_VOLUME_1M:,}-share minimum")
+        if low_value.loc[i] and not illiquid.loc[i]:
+            reasons.append(f"its average traded value of about \u20b9{traded_lakh.loc[i]:,.0f} lakh a day "
+                           f"is below the \u20b9{MIN_BUY_TRADED_VALUE_LAKH:,} lakh minimum")
         notes.loc[i] = (f"Capped at Hold: the factors alone would rate this {signal.loc[i]}, but "
                         + " and ".join(reasons)
                         + ", so it may be hard to buy or sell reliably.")
