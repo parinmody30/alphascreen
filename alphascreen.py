@@ -687,14 +687,17 @@ def score_from_z(z_full):
 
 
 SEVERE_FLAG_Z_PENALTY = 1.5   # composite z deducted per serious red flag
+MILD_FLAG_Z_PENALTY = 0.4     # per other red flag (same weight the signal uses)
 
 
 def apply_severe_flag_penalty(z_full, redlist):
-    """Lower the Investment Score (and rank) of companies carrying serious
-    red flags -- losing money or negative net worth -- so they can't sit at
-    the top of the rankings on the strength of their other factors."""
+    """Lower the Investment Score (and rank) of companies carrying red flags
+    so they can't sit at the top of the rankings on the strength of their
+    other factors. Serious flags (losing money, negative net worth) cost
+    much more than milder ones (weak cash flow, high debt, etc.)."""
     n_severe = redlist.apply(lambda fl: sum(f in SEVERE_RED_FLAGS for f in fl))
-    z_adj = z_full - SEVERE_FLAG_Z_PENALTY * n_severe
+    n_mild = redlist.apply(len) - n_severe
+    z_adj = z_full - SEVERE_FLAG_Z_PENALTY * n_severe - MILD_FLAG_Z_PENALTY * n_mild
     return score_from_z(z_adj), z_adj
 
 
