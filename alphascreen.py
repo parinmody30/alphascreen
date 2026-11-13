@@ -68,6 +68,12 @@ RED_FLAG_THRESHOLDS = {
 
 SUSPICIOUS_EARNINGS_FLAG = "Suspicious earnings data (possible one-off gain)"
 
+# Investability floors: companies below these can still be scored and
+# ranked, but are never rated Buy / Strong Buy (capped at Hold), because
+# they are too small or too thinly traded to buy and sell reliably.
+MIN_BUY_MARKET_CAP_CR = 100       # market cap, Rs crore
+MIN_BUY_AVG_VOLUME_1M = 1000      # "1M Average Volume" column, in shares (missing = fails)
+
 SHORTLIST_MIN_QUALITY = 70        # quality score out of 100
 SHORTLIST_MAX_PEG = 1.5
 
@@ -775,6 +781,19 @@ def signal_for_row(z, quality_score, redflag_count, redflags=()):
     return sig
 
 
+def apply_investability_floors(df, signal):
+    """Cap Buy / Strong Buy at Hold for companies that are too small or too
+    illiquid to trade reliably. Score and rank are left unchanged."""
+    too_small = pd.Series(False, index=df.index)
+    if "market_cap" in df.columns:
+        too_small = df["market_cap"] < MIN_BUY_MARKET_CAP_CR
+    illiquid = pd.Series(False, index=df.index)
+    if "avg_volume_1m" in df.columns:
+        illiquid = df["avg_volume_1m"].isna() | (df["avg_volume_1m"] < MIN_BUY_AVG_VOLUME_1M)
+    cap = (too_small | illiquid) & signal.isin(["Buy", "Strong Buy"])
+    return signal.where(~cap, "Hold")
+
+
 def compute_shortlist(df, quality_score, redflag_count, signal, peg):
     ok = (quality_score >= SHORTLIST_MIN_QUALITY) & (redflag_count == 0) & signal.isin(["Buy", "Strong Buy"])
     peg_ok = pd.Series(True, index=df.index)
@@ -1041,6 +1060,7 @@ def run_pipeline(raw_df, progress=None):
     p("Classifying investment styles and generating recommendations...")
     signal = pd.Series([signal_for_row(zi, qi, ri, fl) for zi, qi, ri, fl in zip(z, pillar_score["quality"], redcount, redlist)],
                         index=df.index)
+    signal = apply_investability_floors(df, signal)
     sector_med_dy = sector_stat(df, "dividend_yield", "median") if "dividend_yield" in df.columns else pd.Series(0, index=df.index)
     styles = classify_styles(df, pillar_score, risk, sector_med_dy)
     shortlist = compute_shortlist(df, pillar_score["quality"], redcount, signal, peg)
