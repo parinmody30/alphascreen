@@ -791,7 +791,25 @@ def apply_investability_floors(df, signal):
     if "avg_volume_1m" in df.columns:
         illiquid = df["avg_volume_1m"].isna() | (df["avg_volume_1m"] < MIN_BUY_AVG_VOLUME_1M)
     cap = (too_small | illiquid) & signal.isin(["Buy", "Strong Buy"])
-    return signal.where(~cap, "Hold")
+
+    # Plain-English reason shown on the Company page for each capped name.
+    notes = pd.Series("", index=df.index)
+    for i in df.index[cap]:
+        reasons = []
+        if too_small.loc[i]:
+            reasons.append(f"its market cap of \u20b9{df.at[i, 'market_cap']:,.0f} Cr is below "
+                           f"the \u20b9{MIN_BUY_MARKET_CAP_CR:,} Cr minimum")
+        if illiquid.loc[i]:
+            vol = df.at[i, "avg_volume_1m"]
+            if pd.isna(vol):
+                reasons.append("there is no trading-volume data")
+            else:
+                reasons.append(f"its 1M average volume of {vol:,.0f} shares is below "
+                               f"the {MIN_BUY_AVG_VOLUME_1M:,}-share minimum")
+        notes.loc[i] = (f"Capped at Hold: the factors alone would rate this {signal.loc[i]}, but "
+                        + " and ".join(reasons)
+                        + ", so it may be hard to buy or sell reliably.")
+    return signal.where(~cap, "Hold"), notes
 
 
 def compute_shortlist(df, quality_score, redflag_count, signal, peg):
@@ -1060,7 +1078,7 @@ def run_pipeline(raw_df, progress=None):
     p("Classifying investment styles and generating recommendations...")
     signal = pd.Series([signal_for_row(zi, qi, ri, fl) for zi, qi, ri, fl in zip(z, pillar_score["quality"], redcount, redlist)],
                         index=df.index)
-    signal = apply_investability_floors(df, signal)
+    signal, signal_notes = apply_investability_floors(df, signal)
     sector_med_dy = sector_stat(df, "dividend_yield", "median") if "dividend_yield" in df.columns else pd.Series(0, index=df.index)
     styles = classify_styles(df, pillar_score, risk, sector_med_dy)
     shortlist = compute_shortlist(df, pillar_score["quality"], redcount, signal, peg)
@@ -1114,6 +1132,7 @@ def run_pipeline(raw_df, progress=None):
                 "opportunity": int(opportunity.loc[i]),
             },
             "signal": signal.loc[i],
+            "signal_note": signal_notes.loc[i],
             "style": styles.loc[i],
             "redflags": redlist.loc[i],
             "redflag_count": int(redcount.loc[i]),
@@ -1390,6 +1409,7 @@ th.col-resizable{position:relative;}
 .decision-pill-row{display:flex; flex-wrap:wrap; gap:6px;}
 .decision-fact{font-size:12.8px; color:var(--text-1); line-height:1.5;}
 .decision-fact + .decision-fact{margin-top:6px;}
+.signal-note{margin-top:10px !important; padding:8px 11px; border-radius:8px; border:1px solid var(--amber); background:rgba(245,158,11,0.08); color:var(--amber);}
 
 /* ---------- factor explainability ---------- */
 .factor-explain{list-style:none; margin-top:9px; padding-top:9px; border-top:1px dashed var(--border); display:flex; flex-direction:column; gap:3px;}
@@ -1974,6 +1994,7 @@ function renderDecisionPanel(r){
         <div>
           <div class="decision-col-label"><span class="dot" style="background:var(--violet)"></span>Why This Recommendation</div>
           <div class="decision-fact">${esc(r.thesis.thesis)}</div>
+          ${r.signal_note ? `<div class="decision-fact signal-note">${esc(r.signal_note)}</div>` : ""}
           <div class="decision-pill-row" style="margin-top:8px;">${r.style.map(x=>`<span class="badge badge-style">${esc(x)}</span>`).join("")}</div>
         </div>
         <div>
