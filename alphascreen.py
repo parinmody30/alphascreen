@@ -378,7 +378,7 @@ def mean_avail(parts):
     return pd.concat(parts, axis=1).mean(axis=1)
 
 
-def restandardize(s, index):
+def restandardize(s, index, clip=True):
     """
     Averaging several already-clipped z-scores shrinks variance. Re-centering 
     each pillar to std=1 across THIS uploaded universe restores real spread before 
@@ -393,7 +393,7 @@ def restandardize(s, index):
     std = s.std()
     
     if pd.isna(std) or std < 1e-9:
-        return s.clip(-3, 3)
+        return s.clip(-3, 3) if clip else s
         
     iqr = s.quantile(0.75) - s.quantile(0.25)
     
@@ -401,9 +401,10 @@ def restandardize(s, index):
     is_curated = (len(s) <= 250) and (iqr < 0.85 or std < 0.5)
     
     if is_curated:
-        return s.clip(-3, 3)
+        return s.clip(-3, 3) if clip else s
     
-    return ((s - s.mean()) / std).clip(-3, 3)
+    out = (s - s.mean()) / std
+    return out.clip(-3, 3) if clip else out
 
 
 # --------------------------------------------------------------------
@@ -672,10 +673,13 @@ def compute_red_flags(df, is_fin):
 
 
 def compute_composite(df, pillar_z):
-    z = sum(pillar_z[k] * w for k, w in PILLAR_WEIGHTS.items())
-    z = restandardize(z, df.index)
-    score = to100(z)
-    return z, to_safe_int(score, 50)
+    raw = sum(pillar_z[k] * w for k, w in PILLAR_WEIGHTS.items())
+    z = restandardize(raw, df.index)               # clipped: drives signals
+    z_full = restandardize(raw, df.index, clip=False)  # unclipped: score + rank
+    # Soft cap: tanh squashes the tails smoothly instead of hard-clipping at
+    # z=3, so the best names keep distinct scores instead of all hitting 100.
+    score = 50 + 50 * np.tanh(z_full / 3)
+    return z, to_safe_int(score.clip(0, 100), 50), z_full.fillna(-99)
 
 
 def compute_opportunity(pillar_z, df):
@@ -700,19 +704,33 @@ def compute_peg(df):
     return np.full(len(df), np.nan)
 
 
-def signal_for_row(z, quality_score, redflag_count):
+# Red flags that mean the business itself is losing money or insolvent.
+# A company carrying any of these can never be rated above Hold, however
+# well it scores on the other factors.
+SEVERE_RED_FLAGS = {
+    "Structurally loss-making (5Y avg NPM < 0)",
+    "Net loss-making",
+    "Negative net worth (book value < 0)",
+}
+
+
+def signal_for_row(z, quality_score, redflag_count, redflags=()):
     z_adj = z - (redflag_count * 0.4)
     if redflag_count >= 3:
         return "Strong Sell"
     if z_adj >= 1.00 and quality_score >= 65:
-        return "Strong Buy"
+        sig = "Strong Buy"
     elif z_adj >= 0.30:
-        return "Buy"
+        sig = "Buy"
     elif z_adj > -0.30:
-        return "Hold"
+        sig = "Hold"
     elif z_adj > -1.00:
-        return "Sell"
-    return "Strong Sell"
+        sig = "Sell"
+    else:
+        sig = "Strong Sell"
+    if sig in ("Strong Buy", "Buy") and any(f in SEVERE_RED_FLAGS for f in redflags):
+        sig = "Hold"
+    return sig
 
 
 def compute_shortlist(df, quality_score, redflag_count, signal, peg):
@@ -970,7 +988,7 @@ def run_pipeline(raw_df, progress=None):
     p("Computing Confidence, Risk and Opportunity scores...")
     confidence = compute_confidence(df, pillar_z)
     risk = compute_risk(df, is_fin)
-    z, inv_score = compute_composite(df, pillar_z)
+    z, inv_score, z_rank = compute_composite(df, pillar_z)
     opportunity = compute_opportunity(pillar_z, df)
     peg = pd.Series(compute_peg(df), index=df.index)
 
@@ -978,7 +996,7 @@ def run_pipeline(raw_df, progress=None):
     redcount, redlist = compute_red_flags(df, is_fin)
 
     p("Classifying investment styles and generating recommendations...")
-    signal = pd.Series([signal_for_row(zi, qi, ri) for zi, qi, ri in zip(z, pillar_score["quality"], redcount)],
+    signal = pd.Series([signal_for_row(zi, qi, ri, fl) for zi, qi, ri, fl in zip(z, pillar_score["quality"], redcount, redlist)],
                         index=df.index)
     sector_med_dy = sector_stat(df, "dividend_yield", "median") if "dividend_yield" in df.columns else pd.Series(0, index=df.index)
     styles = classify_styles(df, pillar_score, risk, sector_med_dy)
@@ -999,7 +1017,7 @@ def run_pipeline(raw_df, progress=None):
     records = []
     
     # Safe float-to-int conversion preventing crashes over NaN/Inf distributions
-    rank_order = to_safe_int(inv_score.rank(ascending=False, method="min"), 9999)
+    rank_order = to_safe_int(z_rank.rank(ascending=False, method="first"), 9999)
     
     PILLAR_LABEL_MAP = {"quality":"Quality", "growth":"Growth", "valuation":"Valuation", "safety":"Safety", "cashflow":"Cash Flow", "ownership":"Ownership", "momentum":"Momentum"}
     
