@@ -64,6 +64,7 @@ RED_FLAG_THRESHOLDS = {
     "promoter_selldown_max": -2.0,   # 6M promoter holding change, percentage points
     "suspicious_pe_max": 3.0,        # PE below this is almost never real, repeatable profit
     "suspicious_ni_to_mcap": 0.5,    # net income above 50% of market cap
+    "pe_mismatch_ratio": (0.6, 1.6), # (market cap / net income) vs reported PE
 }
 
 SUSPICIOUS_EARNINGS_FLAG = "Suspicious earnings data (possible one-off gain)"
@@ -77,6 +78,13 @@ MIN_BUY_AVG_VOLUME_1M = 1000      # "1M Average Volume" column, in shares (missi
 # Share counts alone overstate liquidity for SME stocks, which trade in big
 # lots: a handful of trades can still add up to thousands of shares.
 MIN_BUY_TRADED_VALUE_LAKH = 50
+
+# 5-year growth figures above this (% a year) are treated as bad data and
+# ignored -- they are almost always a tiny base year or a data error.
+MAX_PLAUSIBLE_GROWTH_5Y = 150
+
+# Strong Buy needs a real track record: both 5Y revenue and 5Y EPS growth.
+STRONG_BUY_HISTORY_FIELDS = ["revenue_growth_5y", "eps_growth_5y"]
 
 SHORTLIST_MIN_QUALITY = 70        # quality score out of 100
 SHORTLIST_MAX_PEG = 1.5
@@ -282,6 +290,15 @@ def clean_pipeline(raw):
     # clipped) so the red-flag engine can spot inconsistent earnings data.
     if "pe" in df.columns:
         df["_pe_raw"] = df["pe"].copy()
+
+    # Implausible multi-year growth is a data problem, not a signal.
+    for c in ("revenue_growth_5y", "eps_growth_5y"):
+        if c in df.columns:
+            bad = df[c] > MAX_PLAUSIBLE_GROWTH_5Y
+            if bad.any():
+                df.loc[bad, c] = np.nan
+                log.append(f"Ignored {int(bad.sum())} implausible {c.replace('_', ' ')} value(s) "
+                           f"above {MAX_PLAUSIBLE_GROWTH_5Y}% a year (treated as missing).")
 
     # valuation sanity: a negative multiple isn't "cheap"
     for c in ("pe", "pb", "ev_ebitda"):
@@ -596,7 +613,15 @@ def compute_confidence(df, pillar_z):
         pillars_available = pillars_available + (z.abs() > 1e-9).astype(int)
     pillars_available = (pillars_available / len(pillar_z)).clip(0, 1)
 
-    conf = 100 * (0.8 * coverage + 0.2 * pillars_available)
+    # Track record: multi-year history and beta (which needs ~1Y of trading).
+    # Without these a score rests on one or two years of results.
+    HISTORY_METRICS = ["revenue_growth_5y", "eps_growth_5y", "npm", "beta"]
+    hist_fields = [c for c in HISTORY_METRICS if c in df.columns]
+    if hist_fields:
+        history = df[hist_fields].notna().sum(axis=1) / len(hist_fields)
+        conf = 100 * (0.5 * coverage + 0.3 * history + 0.2 * pillars_available)
+    else:
+        conf = 100 * (0.8 * coverage + 0.2 * pillars_available)
     return to_safe_int(conf, 0)
 
 
@@ -683,6 +708,13 @@ def compute_red_flags(df, is_fin):
             sus |= (df["_pe_raw"] < 0) & (df["net_income"] > 0)
     if "net_income" in df.columns and "market_cap" in df.columns:
         sus |= (df["market_cap"] > 0) & (df["net_income"] > t["suspicious_ni_to_mcap"] * df["market_cap"])
+        if "_pe_raw" in df.columns:
+            # PE implied by market cap / net income should roughly match the
+            # reported PE; a big gap means one-off income or mixed periods.
+            ok = (df["_pe_raw"] > 0) & (df["net_income"] > 0) & (df["market_cap"] > 0)
+            ratio = (df["market_cap"] / df["net_income"]) / df["_pe_raw"]
+            lo, hi = t["pe_mismatch_ratio"]
+            sus |= ok & ((ratio < lo) | (ratio > hi))
     if sus.any():
         flags[SUSPICIOUS_EARNINGS_FLAG] = sus
 
@@ -785,7 +817,22 @@ def signal_for_row(z, quality_score, redflag_count, redflags=()):
     return sig
 
 
-def apply_investability_floors(df, signal):
+def apply_history_requirement(df, signal):
+    """Strong Buy needs 5Y revenue and EPS history; without it, cap at Buy."""
+    fields = [c for c in STRONG_BUY_HISTORY_FIELDS if c in df.columns]
+    notes = pd.Series("", index=df.index)
+    if not fields:
+        return signal, notes
+    missing = df[fields].isna().any(axis=1)
+    cap = missing & (signal == "Strong Buy")
+    for i in df.index[cap]:
+        names = [c.replace("_5y", "").replace("_", " ") for c in fields if pd.isna(df.at[i, c])]
+        notes.loc[i] = (f"Capped at Buy: the factors alone would rate this Strong Buy, but there is no "
+                        f"usable 5-year {' or '.join(names)} history, so the score rests on a short track record.")
+    return signal.where(~cap, "Buy"), notes
+
+
+def apply_investability_floors(df, signal, uncapped=None):
     """Cap Buy / Strong Buy at Hold for companies that are too small or too
     illiquid to trade reliably. Score and rank are left unchanged."""
     too_small = pd.Series(False, index=df.index)
@@ -799,6 +846,8 @@ def apply_investability_floors(df, signal):
     if "avg_volume_1m" in df.columns and "cmp" in df.columns:
         traded_lakh = df["avg_volume_1m"] * df["cmp"] / 1e5
         low_value = traded_lakh < MIN_BUY_TRADED_VALUE_LAKH   # NaN -> False (covered by `illiquid`)
+    if uncapped is None:
+        uncapped = signal
     cap = (too_small | illiquid | low_value) & signal.isin(["Buy", "Strong Buy"])
 
     # Plain-English reason shown on the Company page for each capped name.
@@ -818,7 +867,7 @@ def apply_investability_floors(df, signal):
         if low_value.loc[i] and not illiquid.loc[i]:
             reasons.append(f"its average traded value of about \u20b9{traded_lakh.loc[i]:,.0f} lakh a day "
                            f"is below the \u20b9{MIN_BUY_TRADED_VALUE_LAKH:,} lakh minimum")
-        notes.loc[i] = (f"Capped at Hold: the factors alone would rate this {signal.loc[i]}, but "
+        notes.loc[i] = (f"Capped at Hold: the factors alone would rate this {uncapped.loc[i]}, but "
                         + " and ".join(reasons)
                         + ", so it may be hard to buy or sell reliably.")
     return signal.where(~cap, "Hold"), notes
@@ -1090,7 +1139,10 @@ def run_pipeline(raw_df, progress=None):
     p("Classifying investment styles and generating recommendations...")
     signal = pd.Series([signal_for_row(zi, qi, ri, fl) for zi, qi, ri, fl in zip(z, pillar_score["quality"], redcount, redlist)],
                         index=df.index)
-    signal, signal_notes = apply_investability_floors(df, signal)
+    uncapped_signal = signal.copy()
+    signal, history_notes = apply_history_requirement(df, signal)
+    signal, floor_notes = apply_investability_floors(df, signal, uncapped_signal)
+    signal_notes = floor_notes.where(floor_notes != "", history_notes)
     sector_med_dy = sector_stat(df, "dividend_yield", "median") if "dividend_yield" in df.columns else pd.Series(0, index=df.index)
     styles = classify_styles(df, pillar_score, risk, sector_med_dy)
     shortlist = compute_shortlist(df, pillar_score["quality"], redcount, signal, peg)
