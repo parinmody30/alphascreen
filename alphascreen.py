@@ -154,11 +154,30 @@ DISPLAY_ONLY_FIELDS = {"market_cap", "cmp", "total_debt", "operating_cash_flow",
                         "total_revenue", "eps_q", "book_value", "avg_volume_1m"}
 WINSOR_FIELDS = [c for c in NUMERIC_FIELDS if c not in DISPLAY_ONLY_FIELDS]
 
-FINANCIAL_SECTOR_KEYWORDS = ["bank", "nbfc", "insurance", "financial", "housing financ", "asset management", "amc"]
+# Lenders, brokers, insurers, asset managers and investment holding companies.
+# "financ" covers Consumer / Specialized / Home Finance and Diversified Financials.
+FINANCIAL_SECTOR_KEYWORDS = ["bank", "nbfc", "insurance", "financ", "asset management", "amc",
+                             "broker", "holding & investment"]
+
+# Operating companies whose income is really dividends / investment gains:
+# near-total margins and trading at a discount to book. They get moved into
+# their own peer group and scored with the financial model.
+HOLDCO_SECTOR = "Holding & Investment Companies"
+HOLDCO_MIN_EBITDA_MARGIN = 85
+HOLDCO_MIN_NPM_5Y = 50
+HOLDCO_MAX_PB = 2.0
+
+# Metrics that don't mean anything for a lender or holding company: debt is
+# their raw material and cash flow swings with loans / client money.
+NON_FINANCIAL_METRICS = {"roce", "ebitda_margin", "ev_ebitda", "current_ratio", "interest_coverage",
+                         "debt_to_ebitda", "cash_flow_margin", "cash_conversion_cycle",
+                         # analyst forward-revenue estimates use a different revenue
+                         # definition for lenders (median bank shows about -47%)
+                         "revenue_growth_fwd"}
 
 PARENT_SECTOR_MAP = {
     "private bank": "financial", "psu bank": "financial", "small finance bank": "financial",
-    "housing financ": "financial", "nbfc": "financial", "insurance": "financial", "asset management": "financial", "amc": "financial", "bank": "financial",
+    "housing financ": "financial", "financ": "financial", "broker": "financial", "holding & investment": "financial", "nbfc": "financial", "insurance": "financial", "asset management": "financial", "amc": "financial", "bank": "financial",
     "specialty chemical": "chemicals", "commodity chemical": "chemicals", "agro chemical": "chemicals", "chemical": "chemicals",
     "power": "utilities", "gas distribution": "utilities", "renewables": "utilities", "utility": "utilities",
     "consumer durable": "consumer", "fmcg": "consumer", "retail": "consumer", "textile": "consumer",
@@ -290,6 +309,20 @@ def clean_pipeline(raw):
     # clipped) so the red-flag engine can spot inconsistent earnings data.
     if "pe" in df.columns:
         df["_pe_raw"] = df["pe"].copy()
+
+    # Investment holding companies hiding in operating sectors (e.g. a
+    # holding company filed under "Two Wheelers") are moved to their own
+    # peer group so they aren't scored against manufacturers.
+    if all(c in df.columns for c in ("sector", "ebitda_margin", "npm", "pb")):
+        s_low = df["sector"].fillna("").astype(str).str.lower()
+        already_fin = s_low.apply(lambda x: any(k in x for k in FINANCIAL_SECTOR_KEYWORDS))
+        holdco = (~already_fin & (df["ebitda_margin"] >= HOLDCO_MIN_EBITDA_MARGIN)
+                  & (df["npm"] >= HOLDCO_MIN_NPM_5Y) & (df["pb"] > 0) & (df["pb"] < HOLDCO_MAX_PB))
+        if holdco.any():
+            df.loc[holdco, "sector"] = HOLDCO_SECTOR
+            log.append(f"Reclassified {int(holdco.sum())} company(ies) as '{HOLDCO_SECTOR}' "
+                       f"(EBITDA margin >= {HOLDCO_MIN_EBITDA_MARGIN}%, 5Y net margin >= {HOLDCO_MIN_NPM_5Y}%, "
+                       f"P/B < {HOLDCO_MAX_PB}) and scored them with the financial model.")
 
     # Implausible multi-year growth is a data problem, not a signal.
     for c in ("revenue_growth_5y", "eps_growth_5y"):
@@ -460,7 +493,9 @@ def compute_pillars(df):
         profitability_parts.append(sector_zscore(df, "roce", True).where(~is_fin, np.nan))
     profitability = mean_avail(profitability_parts)
 
-    margin = mean_avail([sector_zscore(df, "ebitda_margin", True) if "ebitda_margin" in df.columns else None,
+    # EBITDA is meaningless for lenders (interest is their cost of goods),
+    # so financials are judged on net margin only.
+    margin = mean_avail([sector_zscore(df, "ebitda_margin", True).where(~is_fin, np.nan) if "ebitda_margin" in df.columns else None,
                           sector_zscore(df, "npm", True) if "npm" in df.columns else None])
     quality_z = pd.Series(mean_avail([profitability, margin]) if (profitability is not None or margin is not None) else 0.0, index=df.index)
 
@@ -469,10 +504,10 @@ def compute_pillars(df):
     hist = mean_avail([sector_zscore(df, "revenue_growth_5y", True) if "revenue_growth_5y" in df.columns else None,
                         sector_zscore(df, "eps_growth_5y", True) if "eps_growth_5y" in df.columns else None])
                         
-    fwd_rev_raw = df["revenue_growth_fwd"] if "revenue_growth_fwd" in df.columns else pd.Series(np.nan, index=df.index)
+    fwd_rev_raw = df["revenue_growth_fwd"].where(~is_fin, np.nan) if "revenue_growth_fwd" in df.columns else pd.Series(np.nan, index=df.index)
     fwd_eps_raw = df["eps_growth_fwd"] if "eps_growth_fwd" in df.columns else pd.Series(np.nan, index=df.index)
     
-    fwd_rev = sector_zscore(df, "revenue_growth_fwd", True) if "revenue_growth_fwd" in df.columns else None
+    fwd_rev = sector_zscore(df, "revenue_growth_fwd", True).where(~is_fin, np.nan) if "revenue_growth_fwd" in df.columns else None
     fwd_eps = sector_zscore(df, "eps_growth_fwd", True) if "eps_growth_fwd" in df.columns else None
     fwd = mean_avail([fwd_rev, fwd_eps])
 
@@ -507,7 +542,7 @@ def compute_pillars(df):
         cr = sector_zscore(df, "current_ratio", True)
         safety_parts.append(cr.where(~is_fin, np.nan))
     if "cash_conversion_cycle" in df.columns:
-        safety_parts.append(sector_zscore(df, "cash_conversion_cycle", False))
+        safety_parts.append(sector_zscore(df, "cash_conversion_cycle", False).where(~is_fin, np.nan))
     if "interest_coverage" in df.columns:
         ic = sector_zscore(df, "interest_coverage", True)
         safety_parts.append(ic.where(~is_fin, np.nan))
@@ -515,6 +550,13 @@ def compute_pillars(df):
         de = sector_zscore(df, "debt_to_ebitda", False)
         safety_parts.append(de.where(~is_fin, np.nan))  # leverage is structural for financials
     safety_z = pd.Series(mean_avail(safety_parts) if safety_parts else 0.0, index=df.index)
+    # Financial model: the CSV has no bank-specific balance-sheet data (NPAs,
+    # capital adequacy), so safety falls back to price stability (low beta)
+    # blended with profit consistency (5Y average net margin).
+    fin_safety = mean_avail([sector_zscore(df, "beta", False) if "beta" in df.columns else None,
+                             sector_zscore(df, "npm", True) if "npm" in df.columns else None])
+    if fin_safety is not None:
+        safety_z = safety_z.where(~is_fin, pd.Series(fin_safety, index=df.index))
 
     # ---- Cash Flow: margin quality + earnings quality (does cash back up
     #      reported profit?), penalised directly when OCF/FCF go negative.
@@ -541,6 +583,9 @@ def compute_pillars(df):
         cashflow_z = cashflow_z.where(df["operating_cash_flow"].isna() | (df["operating_cash_flow"] >= 0),
                                        cashflow_z - 1.0)  # extra penalty for cash-burning operations
     cashflow_z = cashflow_z.clip(-3, 3)
+    # Not scored for financials (loan books and client money swamp cash
+    # flow); the pillar's weight is redistributed in compute_composite.
+    cashflow_z = cashflow_z.where(~is_fin, 0.0)
 
     # ---- Ownership: promoter conviction (level + 6M trend) blended with
     #      institutional conviction (DII+FII levels + 6M trend).
@@ -575,7 +620,9 @@ def compute_pillars(df):
 
     # ---- Valuation: cheaper (relative to sector) is better across every
     #      available multiple.
-    val_parts = [sector_zscore(df, c, False) for c in ("pe", "pb", "ev_ebitda") if c in df.columns]
+    # Financials: P/E and P/B only (P/B is the main yardstick for lenders).
+    val_parts = [sector_zscore(df, c, False).where(~is_fin, np.nan) if c == "ev_ebitda" else sector_zscore(df, c, False)
+                 for c in ("pe", "pb", "ev_ebitda") if c in df.columns]
     valuation_z = pd.Series(mean_avail(val_parts) if val_parts else 0.0, index=df.index)
     
     # Explanatory comment:
@@ -608,8 +655,11 @@ def compute_confidence(df, pillar_z):
     else:
         coverage = pd.Series(0.0, index=df.index)
 
+    is_fin = is_financial_sector(df)
     pillars_available = pd.Series(0, index=df.index)
-    for z in pillar_z.values():
+    for k, z in pillar_z.items():
+        if k == "cashflow":
+            z = z.where(~is_fin, 1.0)   # deliberately not scored for financials
         pillars_available = pillars_available + (z.abs() > 1e-9).astype(int)
     pillars_available = (pillars_available / len(pillar_z)).clip(0, 1)
 
@@ -642,7 +692,10 @@ def compute_risk(df, is_fin):
         weights.append(0.15)
     if "_fcf_margin" in df.columns or "cash_flow_margin" in df.columns:
         cf_col = "_fcf_margin" if "_fcf_margin" in df.columns else "cash_flow_margin"
-        risk_parts.append(-sector_zscore(df, cf_col, True))
+        cf_risk = -sector_zscore(df, cf_col, True)
+        if "roe" in df.columns:   # financials: weak ROE instead of weak cash flow
+            cf_risk = cf_risk.where(~is_fin, -sector_zscore(df, "roe", True))
+        risk_parts.append(cf_risk)
         weights.append(0.15)
     if "promoter_change_6m" in df.columns:
         risk_parts.append(-sector_zscore(df, "promoter_change_6m", True))
@@ -691,9 +744,9 @@ def compute_red_flags(df, is_fin):
     if "revenue_growth_5y" in df.columns:
         flags["Weak growth (5Y revenue growth < -10%)"] = df["revenue_growth_5y"] < t["revenue_growth_min"]
     if "operating_cash_flow" in df.columns:
-        flags["Negative operating cash flow"] = df["operating_cash_flow"] < 0
+        flags["Negative operating cash flow"] = (df["operating_cash_flow"] < 0).where(~is_fin, False)
     if "free_cash_flow" in df.columns:
-        flags["Negative free cash flow"] = df["free_cash_flow"] < 0
+        flags["Negative free cash flow"] = (df["free_cash_flow"] < 0).where(~is_fin, False)
     if "net_income" in df.columns:
         flags["Net loss-making"] = df["net_income"] < 0
     if "book_value" in df.columns:
@@ -737,7 +790,11 @@ def compute_red_flags(df, is_fin):
 
 
 def compute_composite(df, pillar_z):
-    raw = sum(pillar_z[k] * w for k, w in PILLAR_WEIGHTS.items())
+    is_fin = is_financial_sector(df)
+    # Financials skip the Cash Flow pillar; spread its weight over the rest.
+    fin_scale = 1.0 / (1.0 - PILLAR_WEIGHTS["cashflow"])
+    raw = sum(pillar_z[k] * (pd.Series(np.where(is_fin, 0.0 if k == "cashflow" else w * fin_scale, w), index=df.index))
+              for k, w in PILLAR_WEIGHTS.items())
     z = restandardize(raw, df.index)               # clipped: drives signals
     z_full = restandardize(raw, df.index, clip=False)  # unclipped: score + rank
     return z, score_from_z(z_full), z_full.fillna(-99)
@@ -966,9 +1023,12 @@ def build_strengths_weaknesses(df):
         per_metric_z[field] = sector_zscore(df, field, hib)
         per_metric_med[field] = sector_stat(df, field, "median")
 
+    is_fin = is_financial_sector(df)
     for i in df.index:
         pos, neg = [], []
         for field, z in per_metric_z.items():
+            if is_fin.loc[i] and field in NON_FINANCIAL_METRICS:
+                continue
             zi = z.loc[i]
             val = df.at[i, field]
             if pd.isna(val):
@@ -1197,6 +1257,7 @@ def run_pipeline(raw_df, progress=None):
             },
             "signal": signal.loc[i],
             "signal_note": signal_notes.loc[i],
+            "financial": bool(is_fin.loc[i]),
             "style": styles.loc[i],
             "redflags": redlist.loc[i],
             "redflag_count": int(redcount.loc[i]),
@@ -2134,6 +2195,12 @@ function renderCompanyBody(r){
   const s = r.scores;
   const factorCards = PILLARS.map(k=>{
     const v = s[k];
+    if(k==="cashflow" && r.financial) return `<div class="card factor-card">
+      <div class="factor-name">${PILLAR_LABEL[k]}</div>
+      <div class="factor-val" style="color:var(--text-3)">N/A</div>
+      <div class="factor-bar"></div>
+      <ul class="factor-explain"><li class="neutral">Not scored for banks, lenders and holding companies: cash flow swings with loans and client money. Its weight goes to the other factors.</li></ul>
+    </div>`;
     return `<div class="card factor-card">
       <div class="factor-name">${PILLAR_LABEL[k]}</div>
       <div class="factor-val" style="color:${scoreColor(v)}">${v}</div>
